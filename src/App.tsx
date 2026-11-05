@@ -857,25 +857,43 @@ export default function App() {
     };
   }, [exitCount]);
 
-  // --- INTERACTION LISTENER FOR AUDIO UNLOCK (FOR iOS & ANDROID MOBILE SAFETY) ---
-  // Mobile browsers (specifically iOS) block programmatic audio start unless unlocked by a user gesture.
-  // This listener ensures that as soon as the user taps anywhere on the screen while the alarm
-  // is supposed to play, the AudioContext is resumed and plays the alarm sound successfully.
+  const sharedAudioCtxRef = useRef<AudioContext | null>(null);
+
+  // --- INTERACTION LISTENER FOR AUDIO UNLOCK (FOR iOS IPHONE, ANDROID & WINDOWS) ---
+  // Mobile browsers (specifically iOS Safari & Android Chrome) block programmatic audio
+  // unless unlocked by a user gesture. This listener pre-unlocks the audio pipeline on first touch.
   useEffect(() => {
     const handleUserInteractionToUnlockAudio = () => {
+      // 1. Unlock shared AudioContext for alert tones & beeps
+      if (!sharedAudioCtxRef.current) {
+        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+        if (AudioCtx) {
+          try {
+            const ctx = new AudioCtx();
+            sharedAudioCtxRef.current = ctx;
+            const buffer = ctx.createBuffer(1, 1, 22050);
+            const source = ctx.createBufferSource();
+            source.buffer = buffer;
+            source.connect(ctx.destination);
+            source.start(0);
+          } catch (e) {
+            console.warn("AudioContext init error:", e);
+          }
+        }
+      } else if (sharedAudioCtxRef.current.state === 'suspended') {
+        sharedAudioCtxRef.current.resume().catch(() => {});
+      }
+
+      // 2. Unlock main alarm AudioContext if siren is active
       if (exitCount >= 3 && audioContextRef.current) {
         if (audioContextRef.current.state === 'suspended') {
-          audioContextRef.current.resume().then(() => {
-            console.log("AudioContext successfully unlocked/resumed via user interaction.");
-          }).catch((err) => {
-            console.error("Gagal melanjutkan AudioContext:", err);
-          });
+          audioContextRef.current.resume().catch(() => {});
         }
       }
     };
 
     window.addEventListener('click', handleUserInteractionToUnlockAudio);
-    window.addEventListener('touchstart', handleUserInteractionToUnlockAudio);
+    window.addEventListener('touchstart', handleUserInteractionToUnlockAudio, { passive: true });
 
     return () => {
       window.removeEventListener('click', handleUserInteractionToUnlockAudio);
@@ -912,6 +930,7 @@ export default function App() {
   const [activeSubject, setActiveSubject] = useState<Subject | null>(null);
   const [remainingSeconds, setRemainingSeconds] = useState(examDurationMinutes * 60);
   const [securityViolation, setSecurityViolation] = useState<string | null>(null);
+  const [showSecurityWarningModal, setShowSecurityWarningModal] = useState<boolean>(false);
   const [iframeKey, setIframeKey] = useState(0); // to force iframe refresh
   
   // Connection and system states
@@ -1212,6 +1231,8 @@ export default function App() {
       localStorage.setItem('exam_token_validated', 'true');
       setCurrentPage('subjects');
       setTokenInput('');
+      setSecurityViolation(null);
+      setShowSecurityWarningModal(false);
       showToast("Token Berhasil Diverifikasi! Selamat datang.", "success");
     } else {
       setTokenError("Token Ujian Salah atau Tidak Aktif! Silakan hubungi pengawas.");
@@ -1236,6 +1257,7 @@ export default function App() {
       setResetPinInput('');
       setResetPinError(null);
       setSecurityViolation(null);
+      setShowSecurityWarningModal(false);
       setTokenError(null);
       stopAlarm();
       showToast("Sesi berhasil direset oleh pengawas! Anda dapat masuk kembali.", "success");
@@ -1245,40 +1267,166 @@ export default function App() {
     }
   };
 
-  // --- SECURITY MONITORS IN EXAM ---
-  // Detects when student exits fullscreen or switches tabs/windows
+  // Warning beep tone & haptic vibration when security violation occurs (Android, iPhone iOS, & Windows)
+  const playWarningBeep = () => {
+    // 1. Android Haptic Feedback
+    try {
+      if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+        navigator.vibrate([250, 100, 250]);
+      }
+    } catch {
+      // Ignore vibration error
+    }
+
+    // 2. Cross-platform Audio Alert (iOS Safari, Android Chrome, Windows PC)
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      let ctx = sharedAudioCtxRef.current;
+      if (!ctx || ctx.state === 'closed') {
+        if (!AudioCtx) return;
+        ctx = new AudioCtx();
+        sharedAudioCtxRef.current = ctx;
+      }
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(880, ctx.currentTime);
+      osc.frequency.setValueAtTime(440, ctx.currentTime + 0.15);
+      gain.gain.setValueAtTime(0.85, ctx.currentTime);
+      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.35);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.35);
+    } catch {
+      // Audio autoplay restriction handling
+    }
+  };
+
+  // --- MULTI-PLATFORM SECURITY MONITORS IN EXAM (ANDROID, IPHONE & WINDOWS) ---
+  // Mendeteksi jika siswa membuka atau menyentuh aplikasi lain, membuka notifikasi/multitasking,
+  // beralih tab, keluar dari layar penuh, atau meminimalisir jendela ujian di Android, iPhone, & Windows.
   useEffect(() => {
     if (currentPage !== 'exam') {
       hasEnteredFullscreenRef.current = false;
       return;
     }
 
-    // A: Fullscreen monitor
+    let blurTimer: any = null;
+    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || ('ontouchstart' in window && window.innerWidth < 1024);
+
+    // 1. Fullscreen monitor (Mendukung standar W3C & prefix WebKit Android & Windows)
     const handleFullscreenChange = () => {
-      const isCurrentlyFullscreen = !!document.fullscreenElement;
+      const fullscreenEl = document.fullscreenElement || (document as any).webkitFullscreenElement;
+      const isCurrentlyFullscreen = !!fullscreenEl;
       setIsFullscreenActive(isCurrentlyFullscreen);
       
       if (isCurrentlyFullscreen) {
         hasEnteredFullscreenRef.current = true;
       } else if (hasEnteredFullscreenRef.current) {
-        // Student was in fullscreen and exited - trigger strict lockout
+        // Siswa keluar dari mode layar penuh di Android / Windows
         triggerSecurityViolated("Anda telah keluar dari mode layar penuh (Full Screen)!");
       }
     };
 
-    // B: Visibility (tab switching) monitor
+    // 2. Visibility monitor (Android, iPhone & Windows: beralih aplikasi, tekan tombol Home, buka app switcher, ganti tab)
     const handleVisibilityChange = () => {
-      if (document.hidden) {
-        triggerSecurityViolated("Terdeteksi berpindah tab atau meninggalkan jendela ujian!");
+      if (document.hidden || document.visibilityState === 'hidden') {
+        triggerSecurityViolated("Terdeteksi membuka atau beralih ke aplikasi lain saat ujian!");
+      }
+    };
+
+    // 3. Window blur monitor (Android: tarik panel notifikasi, split-screen, chat head; Windows: klik jendela lain/desktop)
+    const handleWindowBlur = () => {
+      if (blurTimer) clearTimeout(blurTimer);
+      blurTimer = setTimeout(() => {
+        const activeEl = document.activeElement;
+        const isExamIframe = activeEl && (
+          activeEl.tagName === 'IFRAME' ||
+          activeEl.id === 'exam-iframe' ||
+          (activeEl as HTMLElement).closest?.('#virtual-exam-webview-viewport')
+        );
+
+        // Jika fokus berada pada iframe soal ujian dan layar masih terlihat aktif
+        if (isExamIframe && !document.hidden && document.visibilityState === 'visible') {
+          // Di perangkat mobile (Android & iPhone), fokus di dalam iframe adalah interaksi sah menjawab soal
+          if (isMobile) return;
+
+          // Di Windows PC desktop, periksa apakah jendela browser kehilangan fokus sistem OS
+          if (!document.hasFocus()) {
+            triggerSecurityViolated("Terdeteksi menyentuh atau membuka aplikasi lain di perangkat Anda!");
+            return;
+          }
+          return;
+        }
+
+        // Jika halaman disembunyikan atau browser kehilangan fokus sistem ke aplikasi lain
+        if (document.hidden || document.visibilityState === 'hidden' || !document.hasFocus()) {
+          triggerSecurityViolated("Terdeteksi menyentuh atau membuka aplikasi lain di perangkat Anda!");
+        }
+      }, 200);
+    };
+
+    const handleWindowFocus = () => {
+      if (blurTimer) {
+        clearTimeout(blurTimer);
+        blurTimer = null;
+      }
+    };
+
+    // 4. Pagehide monitor (Khusus iPhone iOS Safari & Android saat beralih aplikasi ke latar belakang)
+    const handlePageHide = () => {
+      triggerSecurityViolated("Terdeteksi meninggalkan halaman ujian dan membuka aplikasi lain!");
+    };
+
+    // 5. Page Freeze monitor (Page Lifecycle API pada Android & iOS)
+    const handlePageFreeze = () => {
+      triggerSecurityViolated("Terdeteksi aplikasi lain aktif di latar depan!");
+    };
+
+    // 6. Keyboard Shortcuts Trap untuk Windows (Alt+Tab, Win Key, Ctrl+Esc, F11, F12 / DevTools)
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Windows Key (Meta), Alt+Tab, Ctrl+Esc (Start Menu)
+      if (e.key === 'Meta' || (e.altKey && e.key === 'Tab') || (e.ctrlKey && e.key === 'Escape')) {
+        e.preventDefault();
+        triggerSecurityViolated("Terdeteksi tombol sistem untuk berpindah aplikasi!");
+        return;
+      }
+
+      // DevTools shortcuts on Windows / Mac (F12, Ctrl+Shift+I, Ctrl+Shift+J, Ctrl+Shift+C)
+      if (
+        e.key === 'F12' || 
+        ((e.ctrlKey || e.metaKey) && e.shiftKey && ['I', 'J', 'C'].includes(e.key.toUpperCase()))
+      ) {
+        e.preventDefault();
+        triggerSecurityViolated("Terdeteksi percobaan membuka alat inspeksi / aplikasi pengembang!");
+        return;
       }
     };
 
     document.addEventListener('fullscreenchange', handleFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
     document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('blur', handleWindowBlur);
+    window.addEventListener('focus', handleWindowFocus);
+    window.addEventListener('pagehide', handlePageHide);
+    document.addEventListener('freeze', handlePageFreeze);
+    window.addEventListener('keydown', handleKeyDown, true);
 
     return () => {
+      if (blurTimer) clearTimeout(blurTimer);
       document.removeEventListener('fullscreenchange', handleFullscreenChange);
+      document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('blur', handleWindowBlur);
+      window.removeEventListener('focus', handleWindowFocus);
+      window.removeEventListener('pagehide', handlePageHide);
+      document.removeEventListener('freeze', handlePageFreeze);
+      window.removeEventListener('keydown', handleKeyDown, true);
     };
   }, [currentPage]);
 
@@ -1292,6 +1440,8 @@ export default function App() {
         setIsValidated(false);
         localStorage.removeItem('exam_token_validated');
         setSecurityViolation("Keamanan: Terdeteksi keluar aplikasi atau membuka tab lain saat di halaman daftar mata pelajaran!");
+        setShowSecurityWarningModal(true);
+        playWarningBeep();
         setCurrentPage('token');
         showToast("Keamanan aktif: Sesi dibatalkan karena terdeteksi keluar halaman!", "error");
       }
@@ -1349,9 +1499,11 @@ export default function App() {
     };
   }, [currentPage]);
 
-  // Trigger violation lock, clear session and force redirect to page 1
+  // Trigger violation lock, clear session and force redirect to login page (page 1)
   const triggerSecurityViolated = (reason: string) => {
     setSecurityViolation(reason);
+    setShowSecurityWarningModal(true);
+    playWarningBeep();
     clearExamSession();
     
     // Increment the exam exit counter
@@ -1364,10 +1516,11 @@ export default function App() {
       document.exitFullscreen().catch(() => {});
     }
     
-    // Redirect immediately to Halaman Pertama
+    // Redirect immediately to Halaman Pertama (Login / Token)
     setCurrentPage('token');
     setIsValidated(false);
     localStorage.removeItem('exam_token_validated');
+    showToast(`PERINGATAN KEAMANAN: ${reason}`, "error");
   };
 
   // --- COUNTDOWN TIMER ---
@@ -1413,6 +1566,7 @@ export default function App() {
     setActiveSubject(subject);
     setRemainingSeconds(totalDurationSeconds);
     setSecurityViolation(null);
+    setShowSecurityWarningModal(false);
     setIframeKey(prev => prev + 1);
 
     // Save session to localStorage so they can resume on crash/reload
@@ -1558,11 +1712,71 @@ export default function App() {
         </div>
       )}
 
+      {/* --- MODAL PERINGATAN KEAMANAN (MEMBUKA/MENYENTUH APLIKASI LAIN) --- */}
+      {showSecurityWarningModal && currentPage === 'token' && (
+        <div id="security-warning-modal" className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4 select-none animate-in fade-in duration-200">
+          <div className="bg-white rounded-3xl max-w-md w-full p-6 text-center shadow-2xl border-2 border-rose-500 relative animate-in zoom-in-95 duration-200">
+            {/* Pulsing Alert Icon */}
+            <div className="w-16 h-16 bg-rose-100 border-2 border-rose-200 rounded-2xl flex items-center justify-center mx-auto mb-4 text-rose-600 shadow-inner">
+              <ShieldAlert className="w-9 h-9 animate-bounce" />
+            </div>
+
+            <span className="inline-block px-3 py-1 rounded-full bg-rose-100 text-rose-700 font-extrabold text-[11px] tracking-wider uppercase mb-2">
+              Peringatan Pelanggaran Keamanan
+            </span>
+
+            <h3 className="text-xl font-black text-slate-900 tracking-tight">
+              Terdeteksi Membuka Aplikasi Lain!
+            </h3>
+
+            <div className="mt-3 p-3.5 bg-rose-50/90 border border-rose-200 rounded-2xl text-left text-xs space-y-2 text-rose-950">
+              <p className="font-bold flex items-center gap-1.5 text-rose-800">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                <span>{securityViolation || "Terdeteksi membuka atau menyentuh aplikasi lain saat ujian berlangsung!"}</span>
+              </p>
+              <p className="text-[11px] text-slate-600 leading-relaxed font-medium">
+                Sistem Safe Exam mendeteksi aktivitas di luar jendela ujian (membuka atau menyentuh aplikasi lain, membuka notifikasi/multitasking, atau keluar dari layar penuh). Sesi ujian Anda telah dibatalkan secara otomatis dan Anda dikembalikan ke halaman login token.
+              </p>
+            </div>
+
+            <div className="mt-4 flex items-center justify-between p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-700">
+              <span>Catatan Pelanggaran Keluar:</span>
+              <span className="font-mono font-bold text-rose-600 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded-md">
+                {exitCount} / 3 Kali
+              </span>
+            </div>
+
+            {exitCount >= 3 ? (
+              <div className="mt-3 p-3 bg-red-100 border border-red-300 rounded-xl text-left text-[11px] text-red-900 font-semibold flex items-start gap-2">
+                <Volume2 className="w-4 h-4 text-red-600 shrink-0 mt-0.5 animate-pulse" />
+                <span>Batas 3 kali pelanggaran telah tercapai. Alarm darurat berbunyi. Harap hubungi Pengawas Ujian untuk memasukkan PIN reset.</span>
+              </div>
+            ) : (
+              <p className="mt-2 text-[11px] text-slate-500 font-medium">
+                Sisa kesempatan: <strong className="text-rose-600">{Math.max(0, 3 - exitCount)} kali</strong> sebelum sistem terkunci permanen.
+              </p>
+            )}
+
+            <button
+              id="btn-dismiss-security-warning"
+              onClick={() => setShowSecurityWarningModal(false)}
+              className="mt-5 w-full bg-slate-900 hover:bg-slate-800 text-white font-bold py-3 px-5 rounded-xl text-xs transition-all shadow-md active:scale-97 cursor-pointer"
+            >
+              Saya Mengerti & Kembali ke Halaman Login
+            </button>
+
+            <div className="mt-2.5 text-[10px] text-slate-400 font-medium text-center">
+              * Deteksi aktif di HP Android, iPhone (iOS), maupun Windows PC
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* --- RECENT SECURITY VIOLATION WARNING ON LOGIN PAGE --- */}
       {securityViolation && currentPage === 'token' && (
         <div id="security-violation-banner" className="bg-rose-600 text-white p-4 text-center text-sm font-semibold flex items-center justify-center gap-2 shadow-inner">
           <ShieldAlert className="w-5 h-5 animate-pulse shrink-0" />
-          <span>PERINGATAN KEAMANAN: {securityViolation} Sesi Anda dibatalkan secara otomatis demi integritas ujian.</span>
+          <span>PERINGATAN KEAMANAN: {securityViolation} Anda otomatis dikembalikan ke halaman login demi integritas ujian.</span>
         </div>
       )}
 
@@ -1604,6 +1818,10 @@ export default function App() {
                 <p className="text-xs font-semibold text-indigo-600 tracking-widest uppercase mt-0.5">
                   by Mizhar
                 </p>
+                <div className="mt-2 flex items-center justify-center gap-1.5 text-[10px] font-bold text-slate-600 bg-slate-100 px-2.5 py-1 rounded-full border border-slate-200 shadow-2xs">
+                  <ShieldCheck className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                  <span>Proteksi Safe Exam: Android • iPhone • Windows</span>
+                </div>
               </div>
 
               <div className="w-full h-px bg-slate-100 my-2" />
@@ -1998,7 +2216,7 @@ export default function App() {
           {/* Secure System Banner Indicator */}
           <div className="bg-indigo-950/40 border-b border-indigo-900/40 px-2 sm:px-4 py-1 text-[9px] sm:text-[10px] font-bold text-indigo-300 flex items-center justify-center gap-1 select-none shrink-0 text-center">
             <ShieldAlert className="w-3 h-3 text-indigo-400 shrink-0" />
-            <span className="truncate sm:whitespace-normal">MODE AMAN AKTIF: Jangan keluar layar penuh atau menutup jendela ujian!</span>
+            <span className="truncate sm:whitespace-normal">MODE AMAN AKTIF: Dilarang membuka/menyentuh aplikasi lain, beralih tab, atau keluar layar penuh!</span>
           </div>
 
           {/* Secured Virtualized Webview with Windowing & Memory Shield */}
