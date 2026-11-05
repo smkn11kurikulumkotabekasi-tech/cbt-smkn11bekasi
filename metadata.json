@@ -1,0 +1,6 @@
+{
+  "name": "EXAM 11 WEB by Mizhar",
+  "description": "Exam browser and test portal for SMKN 11 Bekasi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
